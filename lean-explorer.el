@@ -17,9 +17,10 @@
 ;; whether the shown C was generated from the source you are looking at, and
 ;; stale C is grayed out.  The source buffer's mode-line carries the same badge.
 ;;
-;; Two backends, switched with `lean-explorer-toggle-backend': `c' shows what
+;; Two backends, cycled with `lean-explorer-toggle-backend': `c' shows what
 ;; lake already emits, `asm' runs `leanc -S' over it and shows the assembly
-;; under .lake/build/lean-explorer/.
+;; under .lake/build/lean-explorer/, and `both' stacks the two in the side
+;; window column, kept in step with each other and with point.
 ;;
 ;; Vibe-coded: written largely by prompting an AI coding agent.  Expect rough
 ;; edges; review before relying on it.
@@ -54,9 +55,9 @@
   :prefix "lean-explorer-")
 
 (defcustom lean-explorer-backend 'c
-  "Which compiler output to show, `c' or `asm'.
+  "Which compiler output to show: `c', `asm', or `both' side by side.
 Set per buffer by `lean-explorer-toggle-backend'."
-  :type '(choice (const c) (const asm)))
+  :type '(choice (const c) (const asm) (const both)))
 
 (defcustom lean-explorer-lake-program "lake"
   "The lake executable used to build the C facet."
@@ -114,7 +115,8 @@ showing the C of the buffer it was opened from."
     (side . right)
     (window-width . 0.5)
     (dedicated . t))
-  "`display-buffer' action used to show the C buffer."
+  "`display-buffer' action used to show an output buffer.
+A `slot' entry is appended per backend, so that `both' stacks them."
   :type 'sexp)
 
 (defface lean-explorer-fresh '((t :inherit success :weight bold))
@@ -133,9 +135,9 @@ showing the C of the buffer it was opened from."
 
 (defvar-local lean-explorer--module nil)
 (defvar-local lean-explorer--root nil)
-(defvar-local lean-explorer--artifact nil "Absolute path of the file on show.")
+(defvar-local lean-explorer--artifacts nil "Alist of backend to generated file.")
 (defvar-local lean-explorer--c-file nil "Absolute path of the generated .c.")
-(defvar-local lean-explorer--view nil "The buffer showing the C.")
+(defvar-local lean-explorer--views nil "Alist of backend to the buffer showing it.")
 (defvar-local lean-explorer--proc nil)
 (defvar-local lean-explorer--state 'unknown "One of unknown, fresh, stale, building, failed.")
 (defvar-local lean-explorer--built-hash nil "Hash of the source that produced the shown C.")
@@ -203,13 +205,26 @@ showing the C of the buffer it was opened from."
   (expand-file-name (concat (string-join parts "/") ".s")
                     (expand-file-name ".lake/build/lean-explorer/" root)))
 
+(defun lean-explorer--backends ()
+  "The backends this buffer shows, in window order."
+  (pcase lean-explorer-backend
+    ('asm '(asm))
+    ('both '(c asm))
+    (_ '(c))))
+
 (defun lean-explorer--set-paths ()
-  "Point the C and artifact paths at the current backend's output."
+  "Record where each backend's output lives for this module."
   (let ((parts (split-string lean-explorer--module "\\.")))
     (setq lean-explorer--c-file (lean-explorer--ir-file lean-explorer--root parts)
-          lean-explorer--artifact (if (eq lean-explorer-backend 'asm)
-                                      (lean-explorer--asm-file lean-explorer--root parts)
-                                    lean-explorer--c-file))))
+          lean-explorer--artifacts
+          (list (cons 'c lean-explorer--c-file)
+                (cons 'asm (lean-explorer--asm-file lean-explorer--root parts))))))
+
+(defun lean-explorer--artifact (backend)
+  (alist-get backend lean-explorer--artifacts))
+
+(defun lean-explorer--active-artifacts ()
+  (mapcar #'lean-explorer--artifact (lean-explorer--backends)))
 
 (defun lean-explorer--hash ()
   "Hash of the source buffer's whole contents."
@@ -282,22 +297,47 @@ showing the C of the buffer it was opened from."
     "   g rebuild · b backend · l log · q close"))
 
 (defun lean-explorer--lighter ()
-  (concat " " (propertize (format "C:%s" (alist-get lean-explorer--state lean-explorer--labels))
+  (concat " " (propertize (format "%s:%s"
+                                  (mapconcat #'symbol-name (lean-explorer--backends) "+")
+                                  (alist-get lean-explorer--state lean-explorer--labels))
                           'face (lean-explorer--face lean-explorer--state))))
 
-(defun lean-explorer--ensure-view ()
-  "Return the C buffer of the current source buffer, creating it if needed."
-  (unless (buffer-live-p lean-explorer--view)
-    (let* ((src (current-buffer))
-           (name (lean-explorer--view-name lean-explorer--module lean-explorer-backend))
-           (taken (get-buffer name))
-           ;; a second buffer on the same module must not steal the first's view
-           (buf (if (and taken (buffer-live-p (buffer-local-value 'lean-explorer--source taken)))
-                    (generate-new-buffer name)
-                  (get-buffer-create name))))
-      (lean-explorer--configure-view buf src lean-explorer-backend)
-      (setq lean-explorer--view buf)))
-  lean-explorer--view)
+(defun lean-explorer--view (backend)
+  "This buffer's live view of BACKEND, if any."
+  (let ((buf (alist-get backend lean-explorer--views)))
+    (and (buffer-live-p buf) buf)))
+
+(defun lean-explorer--active-views ()
+  "Alist of (BACKEND . BUFFER) for the shown backends, in window order."
+  (cl-loop for backend in (lean-explorer--backends)
+           for buf = (lean-explorer--view backend)
+           when buf collect (cons backend buf)))
+
+(defun lean-explorer--ensure-views ()
+  "Create a view buffer per shown backend, and return them in window order."
+  (let ((src (current-buffer)))
+    (dolist (backend (lean-explorer--backends))
+      (unless (lean-explorer--view backend)
+        (let* ((name (lean-explorer--view-name lean-explorer--module backend))
+               (taken (get-buffer name))
+               ;; a second buffer on the same module must not steal the first's view
+               (buf (if (and taken (buffer-live-p (buffer-local-value 'lean-explorer--source taken)))
+                        (generate-new-buffer name)
+                      (get-buffer-create name))))
+          (lean-explorer--configure-view buf src backend)
+          (setf (alist-get backend lean-explorer--views) buf)))))
+  (mapcar #'cdr (lean-explorer--active-views)))
+
+(defun lean-explorer--prune-views ()
+  "Kill the views of backends that are no longer shown."
+  (let ((shown (lean-explorer--backends)))
+    (pcase-dolist (`(,backend . ,buf) lean-explorer--views)
+      (unless (memq backend shown)
+        (when (buffer-live-p buf)
+          (kill-buffer buf))))
+    (setq lean-explorer--views
+          (cl-remove-if-not (lambda (entry) (memq (car entry) shown))
+                            lean-explorer--views))))
 
 (defun lean-explorer--view-name (module backend)
   (format "*lean-%s: %s*" (if (eq backend 'asm) "asm" "c") module))
@@ -323,44 +363,48 @@ showing the C of the buffer it was opened from."
            (c-ts-mode))
           (t (c-mode)))))
 
-(defun lean-explorer--load-artifact (src)
-  "Reload the generated C of SRC into its view buffer, keeping the viewport."
-  (let ((buf (buffer-local-value 'lean-explorer--view src))
-        (file (buffer-local-value 'lean-explorer--artifact src)))
-    (when (and (buffer-live-p buf) (file-readable-p file))
-      (with-current-buffer buf
-        (let* ((inhibit-read-only t)
-               (line (line-number-at-pos))
-               (col (current-column))
-               (win (get-buffer-window buf t))
-               (top (and win (line-number-at-pos (window-start win)))))
-          (erase-buffer)
-          (insert-file-contents file)
-          (set-buffer-modified-p nil)
-          (cond ((> (buffer-size) lean-explorer-font-lock-max-size)
-                 (when font-lock-mode
-                   (setq lean-explorer--font-lock-suppressed t)
-                   (font-lock-mode -1)))
-                (lean-explorer--font-lock-suppressed
-                 (setq lean-explorer--font-lock-suppressed nil)
-                 (font-lock-mode 1)))
-          (goto-char (point-min))
-          (forward-line (1- line))
-          (move-to-column col)
-          (when top
-            (save-excursion
-              (goto-char (point-min))
-              (forward-line (1- top))
-              (set-window-start win (point))))
-          (setq lean-explorer--followed nil))))))
+(defun lean-explorer--load-artifacts (src)
+  "Reload every view of SRC from its backend's output."
+  (with-current-buffer src
+    (pcase-dolist (`(,backend . ,buf) (lean-explorer--active-views))
+      (lean-explorer--load-into buf (lean-explorer--artifact backend)))))
+
+(defun lean-explorer--load-into (buf file)
+  "Reload BUF from FILE, keeping the viewport."
+  (when (and (buffer-live-p buf) (file-readable-p file))
+    (with-current-buffer buf
+      (let* ((inhibit-read-only t)
+             (line (line-number-at-pos))
+             (col (current-column))
+             (win (get-buffer-window buf t))
+             (top (and win (line-number-at-pos (window-start win)))))
+        (erase-buffer)
+        (insert-file-contents file)
+        (set-buffer-modified-p nil)
+        (cond ((> (buffer-size) lean-explorer-font-lock-max-size)
+               (when font-lock-mode
+                 (setq lean-explorer--font-lock-suppressed t)
+                 (font-lock-mode -1)))
+              (lean-explorer--font-lock-suppressed
+               (setq lean-explorer--font-lock-suppressed nil)
+               (font-lock-mode 1)))
+        (goto-char (point-min))
+        (forward-line (1- line))
+        (move-to-column col)
+        (when top
+          (save-excursion
+            (goto-char (point-min))
+            (forward-line (1- top))
+            (set-window-start win (point))))
+        (setq lean-explorer--followed nil)))))
 
 ;;; Freshness
 
 (defun lean-explorer--set-state (state)
   (setq lean-explorer--state state)
   (force-mode-line-update)
-  (when (buffer-live-p lean-explorer--view)
-    (with-current-buffer lean-explorer--view
+  (pcase-dolist (`(,_ . ,buf) (lean-explorer--active-views))
+    (with-current-buffer buf
       (lean-explorer--apply-dim state)
       (force-mode-line-update))))
 
@@ -381,7 +425,9 @@ showing the C of the buffer it was opened from."
   (unless (or (process-live-p lean-explorer--proc) (eq lean-explorer--state 'failed))
     (lean-explorer--set-state
      (cond ((null lean-explorer--built-hash)
-            (if (file-readable-p lean-explorer--artifact) 'stale 'unknown))
+            (if (cl-some #'file-readable-p (lean-explorer--active-artifacts))
+                'stale
+              'unknown))
            ((equal lean-explorer--built-hash (lean-explorer--hash)) 'fresh)
            (t 'stale)))))
 
@@ -425,10 +471,10 @@ showing the C of the buffer it was opened from."
 (defun lean-explorer--commands ()
   "The commands that regenerate this buffer's artifact, in order."
   (cons (list lean-explorer-lake-program "build" (concat lean-explorer--module ":c"))
-        (when (eq lean-explorer-backend 'asm)
+        (when (memq 'asm (lean-explorer--backends))
           (list (append (list lean-explorer-leanc-program)
                         lean-explorer-asm-flags
-                        (list "-o" lean-explorer--artifact lean-explorer--c-file))))))
+                        (list "-o" (lean-explorer--artifact 'asm) lean-explorer--c-file))))))
 
 (defun lean-explorer--build ()
   "Regenerate this buffer's artifact by running the backend's commands."
@@ -446,7 +492,8 @@ showing the C of the buffer it was opened from."
         (let ((lean-explorer--saving t))
           (save-buffer)))
       (setq lean-explorer--pending nil)
-      (make-directory (file-name-directory lean-explorer--artifact) t)
+      (dolist (file (lean-explorer--active-artifacts))
+        (make-directory (file-name-directory file) t))
       (with-current-buffer (lean-explorer--log-buffer)
         (let ((inhibit-read-only t))
           (erase-buffer)))
@@ -484,7 +531,7 @@ showing the C of the buffer it was opened from."
 (defun lean-explorer--succeed (src hash)
   (with-current-buffer src
     (setq lean-explorer--built-hash hash)
-    (lean-explorer--load-artifact src)
+    (lean-explorer--load-artifacts src)
     (lean-explorer--set-state (if (equal hash (lean-explorer--hash)) 'fresh 'stale))
     (lean-explorer--drain-pending)))
 
@@ -597,29 +644,48 @@ the LINE, and NEXT the character following it."
             (t 4)))))
 
 (defun lean-explorer-follow-declaration ()
-  "Scroll the C window to the declaration at point."
+  "Scroll every visible output window to the declaration at point."
   (interactive)
-  (let* ((name (lean-explorer--declaration-at-point))
-         (buf lean-explorer--view)
-         (win (and (buffer-live-p buf) (get-buffer-window buf t))))
-    (when (and name win)
-      (let ((pos (with-current-buffer buf (lean-explorer--symbol-position name))))
-        (if (not pos)
-            (when (called-interactively-p 'interactive)
-              (message "lean-explorer: no C symbol for %s" name))
+  (when-let* ((name (lean-explorer--declaration-at-point)))
+    (let ((found nil))
+      (pcase-dolist (`(,_ . ,buf) (lean-explorer--active-views))
+        (when-let* ((win (get-buffer-window buf t))
+                    (pos (with-current-buffer buf (lean-explorer--symbol-position name))))
+          (setq found t)
           (with-selected-window win
             (goto-char pos)
             (recenter 3)
             (when (fboundp 'pulse-momentary-highlight-one-line)
               (pulse-momentary-highlight-one-line pos)))
-          (with-current-buffer buf (setq lean-explorer--followed name)))))))
+          (with-current-buffer buf
+            (setq lean-explorer--followed name))))
+      (when (and (not found) (called-interactively-p 'interactive))
+        (message "lean-explorer: no symbol for %s" name)))))
 
-(defun lean-explorer--view-window ()
-  "A window showing some explorer buffer, if one is visible."
-  (catch 'found
-    (dolist (win (window-list-1 nil nil t))
-      (when (buffer-local-value 'lean-explorer--source (window-buffer win))
-        (throw 'found win)))))
+(defun lean-explorer--explorer-windows ()
+  "Every window showing an explorer buffer, in display order."
+  (cl-remove-if-not (lambda (win)
+                      (buffer-local-value 'lean-explorer--source (window-buffer win)))
+                    (window-list-1 nil nil t)))
+
+(defun lean-explorer--show-in (win buf)
+  "Show BUF in WIN, which may be a dedicated side window."
+  (let ((dedicated (window-dedicated-p win)))
+    (set-window-dedicated-p win nil)
+    (set-window-buffer win buf)
+    (set-window-dedicated-p win dedicated)))
+
+(defun lean-explorer--display ()
+  "Show each shown backend in its own slot of the side window column."
+  (let ((slot 0))
+    (dolist (buf (lean-explorer--ensure-views))
+      (display-buffer buf (append lean-explorer-display-action
+                                  (list (cons 'slot slot))))
+      (setq slot (1+ slot)))))
+
+(defun lean-explorer--visible-p ()
+  (cl-some (lambda (entry) (get-buffer-window (cdr entry) t))
+           (lean-explorer--active-views)))
 
 (defun lean-explorer--maybe-switch ()
   "Point a visible explorer window at the Lean buffer that is now current."
@@ -629,9 +695,9 @@ the LINE, and NEXT the character following it."
              (not (minibufferp))
              buffer-file-name
              (string-suffix-p ".lean" buffer-file-name))
-    (when-let* ((win (lean-explorer--view-window)))
-      (let ((old (buffer-local-value 'lean-explorer--source (window-buffer win))))
-        ;; stay on whichever output the window was already showing
+    (when-let* ((wins (lean-explorer--explorer-windows)))
+      (let ((old (buffer-local-value 'lean-explorer--source (window-buffer (car wins)))))
+        ;; stay on whichever outputs the windows were already showing
         (when (buffer-live-p old)
           (setq-local lean-explorer-backend
                       (buffer-local-value 'lean-explorer-backend old)))
@@ -639,11 +705,10 @@ the LINE, and NEXT the character following it."
         (if (not lean-explorer-mode)
             ;; remember the failure, or the idle timer would retry it forever
             (setq lean-explorer--declined t)
-          ;; reuse the window, so a dedicated side window does not blink away
-          (let ((dedicated (window-dedicated-p win)))
-            (set-window-dedicated-p win nil)
-            (set-window-buffer win lean-explorer--view)
-            (set-window-dedicated-p win dedicated))
+          ;; reuse the windows, so dedicated side windows do not blink away
+          (cl-loop for win in wins
+                   for buf in (lean-explorer--ensure-views)
+                   do (lean-explorer--show-in win buf))
           (when (and (buffer-live-p old) (not (eq old (current-buffer))))
             (with-current-buffer old (lean-explorer-mode -1))))))))
 
@@ -653,49 +718,49 @@ the LINE, and NEXT the character following it."
 
 (defun lean-explorer--maybe-follow ()
   (when (and lean-explorer-follow-point
-             (bound-and-true-p lean-explorer-mode)
-             (buffer-live-p lean-explorer--view)
-             (get-buffer-window lean-explorer--view t))
+             (bound-and-true-p lean-explorer-mode))
     (let ((name (lean-explorer--declaration-at-point)))
       (when (and name
-                 (not (equal name (buffer-local-value 'lean-explorer--followed
-                                                      lean-explorer--view))))
+                 (cl-some (lambda (entry)
+                            (let ((buf (cdr entry)))
+                              (and (get-buffer-window buf t)
+                                   (not (equal name (buffer-local-value
+                                                     'lean-explorer--followed buf))))))
+                          (lean-explorer--active-views)))
         (lean-explorer-follow-declaration)))))
 
 ;;; Entry points
 
 (defun lean-explorer-rebuild ()
-  "Regenerate the C for the source buffer, saving it first if needed."
+  "Regenerate the output for the source buffer, saving it first if needed."
   (interactive)
   (with-current-buffer (lean-explorer--source-buffer)
     (lean-explorer--build)))
 
 (defun lean-explorer-set-backend (backend)
-  "Show BACKEND, `c' or `asm', in this buffer's explorer."
-  (interactive (list (intern (completing-read "Backend: " '("c" "asm") nil t))))
+  "Show BACKEND in this buffer's explorer: `c', `asm', or `both'."
+  (interactive (list (intern (completing-read "Backend: " '("c" "asm" "both") nil t))))
   (with-current-buffer (lean-explorer--source-buffer)
     (unless (eq backend lean-explorer-backend)
       (setq-local lean-explorer-backend backend)
       (lean-explorer--set-paths)
       (setq lean-explorer--built-hash nil)
-      (let ((src (current-buffer)))
-        (when (buffer-live-p lean-explorer--view)
-          (with-current-buffer lean-explorer--view
-            (let ((inhibit-read-only t))
-              (erase-buffer))
-            (rename-buffer (lean-explorer--view-name
-                            (buffer-local-value 'lean-explorer--module src) backend)
-                           t)
-            (lean-explorer--configure-view (current-buffer) src backend))))
+      ;; killing a dropped view takes its window with it; the rest are
+      ;; redisplayed into the same slots
+      (lean-explorer--prune-views)
+      (lean-explorer--display)
       (lean-explorer--adopt-existing)
       (when (memq lean-explorer--state '(stale unknown))
         (lean-explorer--build)))))
 
 (defun lean-explorer-toggle-backend ()
-  "Switch this explorer between the generated C and its assembly."
+  "Cycle this explorer through the generated C, its assembly, and both."
   (interactive)
   (with-current-buffer (lean-explorer--source-buffer)
-    (lean-explorer-set-backend (if (eq lean-explorer-backend 'asm) 'c 'asm))))
+    (lean-explorer-set-backend (pcase lean-explorer-backend
+                                 ('c 'asm)
+                                 ('asm 'both)
+                                 (_ 'c)))))
 
 (defun lean-explorer-show-log ()
   "Show the output of the last lake build."
@@ -709,25 +774,30 @@ the LINE, and NEXT the character following it."
       (user-error "Not a lean-explorer buffer")))
 
 (defun lean-explorer--adopt-existing ()
-  "Load the C already on disk, trusting it if it is newer than the source."
-  (let ((c lean-explorer--artifact)
-        (src (buffer-file-name)))
-    (cond
-     ((not (file-readable-p c))
-      (lean-explorer--set-state 'unknown))
-     ((and (not (buffer-modified-p))
-           (time-less-p (file-attribute-modification-time (file-attributes src))
-                        (file-attribute-modification-time (file-attributes c))))
-      (setq lean-explorer--built-hash (lean-explorer--hash))
-      (lean-explorer--load-artifact (current-buffer))
-      (lean-explorer--set-state 'fresh))
-     (t
-      (lean-explorer--load-artifact (current-buffer))
-      (lean-explorer--set-state 'stale)))))
+  "Load what is on disk, trusting it if every output is newer than the source."
+  (let* ((files (lean-explorer--active-artifacts))
+         (source (buffer-file-name))
+         (complete (cl-every #'file-readable-p files))
+         (newer (and complete
+                     (not (buffer-modified-p))
+                     (cl-every (lambda (file)
+                                 (time-less-p (file-attribute-modification-time
+                                               (file-attributes source))
+                                              (file-attribute-modification-time
+                                               (file-attributes file))))
+                               files))))
+    (lean-explorer--load-artifacts (current-buffer))
+    (cond ((not complete)
+           (lean-explorer--set-state 'unknown))
+          (newer
+           (setq lean-explorer--built-hash (lean-explorer--hash))
+           (lean-explorer--set-state 'fresh))
+          (t
+           (lean-explorer--set-state 'stale)))))
 
 ;;;###autoload
 (define-minor-mode lean-explorer-mode
-  "Keep a buffer of Lean's generated C in sync with this source file."
+  "Keep buffers of Lean's compiler output in sync with this source file."
   :lighter (:eval (lean-explorer--lighter))
   (if lean-explorer-mode
       (pcase (and buffer-file-name (lean-explorer--resolve buffer-file-name))
@@ -738,7 +808,7 @@ the LINE, and NEXT the character following it."
          (add-hook 'after-save-hook #'lean-explorer--after-save nil t)
          (add-hook 'after-change-functions #'lean-explorer--after-change nil t)
          (add-hook 'kill-buffer-hook #'lean-explorer--cleanup nil t)
-         (lean-explorer--ensure-view)
+         (lean-explorer--ensure-views)
          (lean-explorer--adopt-existing)
          (when (and lean-explorer-build-on-open
                     (memq lean-explorer--state '(stale unknown)))
@@ -767,9 +837,10 @@ the LINE, and NEXT the character following it."
     (delete-process lean-explorer--proc))
   (when-let* ((log (get-buffer (lean-explorer--log-name))))
     (kill-buffer log))
-  (when (buffer-live-p lean-explorer--view)
-    (kill-buffer lean-explorer--view))
-  (setq lean-explorer--view nil
+  (pcase-dolist (`(,_ . ,buf) lean-explorer--views)
+    (when (buffer-live-p buf)
+      (kill-buffer buf)))
+  (setq lean-explorer--views nil
         lean-explorer--proc nil
         lean-explorer--pending nil
         lean-explorer--timer nil
@@ -791,20 +862,19 @@ the LINE, and NEXT the character following it."
 
 ;;;###autoload
 (defun lean-explorer ()
-  "Open the generated C of this Lean buffer in a side window, or close it."
+  "Open this Lean buffer's compiler output in a side window, or close it."
   (interactive)
   (cond
    ((bound-and-true-p lean-explorer--source)
     (quit-window))
    ((not (and buffer-file-name (string-suffix-p ".lean" buffer-file-name)))
     (user-error "lean-explorer: not visiting a .lean file"))
-   ((and lean-explorer-mode (buffer-live-p lean-explorer--view)
-         (get-buffer-window lean-explorer--view t))
+   ((and lean-explorer-mode (lean-explorer--visible-p))
     (lean-explorer-mode -1))
    (t
     (unless lean-explorer-mode (lean-explorer-mode 1))
     (when lean-explorer-mode
-      (display-buffer (lean-explorer--ensure-view) lean-explorer-display-action)
+      (lean-explorer--display)
       (lean-explorer--maybe-follow)))))
 
 (provide 'lean-explorer)
