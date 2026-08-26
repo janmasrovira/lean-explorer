@@ -1,0 +1,45 @@
+A compiler explorer for [[https://lean-lang.org][Lean 4]] inside Emacs: a side
+buffer showing the C that ~lake build <Module>:c~ generates for the file you are
+editing, or the assembly ~leanc -S~ makes of it, kept in sync as you save.
+
+#+begin_quote
+⚠️ *Vibe-coded.* This project is written largely by prompting an AI coding
+agent. Expect rough edges; review before relying on it.
+#+end_quote
+
+* Installation
+
+#+begin_src elisp
+(add-to-list 'load-path "/path/to/lean-explorer")
+(autoload 'lean-explorer "lean-explorer" nil t)
+#+end_src
+
+** Doom Emacs
+
+#+begin_src elisp
+(add-load-path! "~/projects/lean-explorer")
+(use-package! lean-explorer :commands (lean-explorer lean-explorer-mode))
+(map! :map neo-lean-mode-map :localleader "c" #'lean-explorer)
+#+end_src
+
+** Requirements
+
+- Emacs 29.1+.
+- ~lake~ on ~PATH~.
+
+* Usage
+
+~M-x lean-explorer~ in a ~.lean~ file inside a Lake project opens the generated C
+in a side window, and closes it again. A header line badge says whether that C
+was generated from the source currently in the buffer, and stale C is grayed out.
+The window follows the Lean buffer you switch to, and the declaration at point
+within it (~lean-explorer-follow-buffer~, ~lean-explorer-follow-point~).
+
+~b~ switches between the two backends, ~g~ rebuilds, ~l~ shows the build log and
+~q~ closes. Under evil those are ~gb~, ~gr~, ~gl~ and ~q~; ~C-c C-b~, ~C-c C-c~
+and ~C-c C-l~ work in both cases. Assembly is written to
+~.lake/build/lean-explorer/~ and needs ~leanc~ on ~PATH~, which elan provides.
+
+Options live in ~M-x customize-group RET lean-explorer~, notably
+~lean-explorer-backend~, ~lean-explorer-asm-flags~ and
+~lean-explorer-auto-build~ (~save~, ~idle~ or ~manual~).
